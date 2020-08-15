@@ -1,6 +1,5 @@
 """ Analysis of synthetic peptides """
 import os
-import sys
 import re
 import collections
 import itertools
@@ -381,9 +380,6 @@ class CorrectSynthesisMatch:
         if matches:
             for match in matches:
                 candidates += self._correct_psm(match)
-        for p in candidates:
-            if p.seq == "LDEKENLSAK":
-                print(p)
 
         if not candidates:
             # sequence tag search
@@ -657,46 +653,41 @@ class CorrectSynthesisMatch:
                  + constants.FIXED_MASSES["H2O"]
                  + sum(mod.mass for mod in mods))
         # get possible modified sites
-        unmod_res = [r for i, r in enumerate(seq)
+        unmod_res = [(i+1, r) for i, r in enumerate(seq)
                      if not any(mod.site == i+1 for mod in mods)]
         # consider terminal modifications too
         if not any(m.site == "nterm" for m in mods):
-            unmod_res.insert(0, "nterm")
+            unmod_res.insert(0, (0, "nterm"))
         if not any(m.site == "cterm" for m in mods):
-            unmod_res.append("cterm")
+            unmod_res.append((len(seq), "cterm"))
+        unmod_res = [r for r in unmod_res if r[1] in self.artifacts]
 
-        # modification combinations
-        added_mod_sets = []
-        for i in range(2):
-            for r in itertools.combinations(enumerate(unmod_res), i + 1):
-                mod_sets = [
-                    [(j, mod[0], m) for mod, m in
-                     zip(self.artifacts["mods"], self.artifacts["mass"])
-                     if mod[1] == rk] for j, rk in r
-                ]
-                added_mod_sets.append(mod_sets)
+        # re-organize the artifacts
+        artifacts, masses = [], []
+        for j, r in unmod_res:
+            artifacts.extend([(j, mod, m) for mod, m in self.artifacts[r]])
+            masses.extend([m for _, m in self.artifacts[r]])
+
+        n, n1 = len(seq), len(masses)
+
+        # artifact combinations
+        artifacts += list(itertools.combinations(artifacts, 2))
+        masses += [m1 + m2 for m1, m2 in itertools.combinations(masses, 2)]
+        masses = np.array(masses)
 
         # iterate through all possibilities
-        added_mods = []
         for c in range(2, 5):
             mass = (mz - constants.FIXED_MASSES["H"]) * c
             dm = mass - pmass
             # do all possible combinations
-            for mod_set in added_mod_sets:
-                added_mods += [
-                    (c, x) for x in itertools.product(*mod_set)
-                    if abs(dm - sum(m for _, _, m in x)) <= self.tol
-                ]
-        # all candidates
-        n = len(unmod_res)
-        for c, mx in added_mods:
-            mod_x = []
-            for j, name, m in mx:
-                site = "nterm" if j == 0 else "cterm" if j == n-1 else j
-                mod_x.append(ModSite(m, site, name))
-            candidates.append(Peptide(seq, c, mod_x + mods))
-
-        print(seq, len(candidates))
+            ix, = np.where(np.absolute(dm - masses) <= self.tol)
+            for i in ix:
+                mod_x = []
+                ax = [artifacts[i]] if i < n1 else artifacts[i]
+                for j, name, m in ax:
+                    site = "nterm" if j == 0 else "cterm" if j == n - 1 else j
+                    mod_x.append(ModSite(m, site, name))
+                candidates.append(Peptide(seq, c, mod_x + mods))
 
         return candidates
 
@@ -926,14 +917,18 @@ class CorrectSynthesisMatch:
                          for ix in itertools.combinations(range(nseq), i+1)])
         combs_add = {"residues": res, "mass": mass}
 
-        # remove artifacts if residues not existed in seq
-        ix = [i for i, r in enumerate(self.artifacts["mods"][:, 1])
-              if r in seq]
+        # consider artifact modifications
+        seq_n = seq_arr.tolist()
         if nterm:
-            ix += np.where(self.artifacts["mods"][:, 1] == "nterm")[0].tolist()
+            seq_n.append("nterm")
         if cterm:
-            ix += np.where(self.artifacts["mods"][:, 1] == "cterm")[0].tolist()
-        artifacts = {key: vals[ix] for key, vals in self.artifacts.items()}
+            seq_n.append("cterm")
+        res, mass = [], []
+        for r in seq_n:
+            if r in self.artifacts:
+                res += [[mod, r] for mod, _ in self.artifacts[r]]
+                mass += [m for _, m in self.artifacts[r]]
+        artifacts = {"mods": np.array(res, dtype=str), "mass": np.array(mass)}
 
         return combs, combs_add, artifacts, seq_arr
 
@@ -1049,10 +1044,8 @@ class CorrectSynthesisMatch:
             artifacts = json.load(f)
 
         # parse the modifications
-        _res, _mass = [], []
-        for _mod in artifacts.keys():
-            for _site in artifacts[_mod]["sites"]:
-                _res.append([_mod, _site])
-                _mass.append(artifacts[_mod]["mass"])
-        self.artifacts = {"mods": np.array(_res, dtype=str),
-                          "mass": np.array(_mass)}
+        res = collections.defaultdict(list)
+        for mod, vals in artifacts.items():
+            for site in vals["sites"]:
+                res[site].append((mod, vals["mass"]))
+        self.artifacts = res
