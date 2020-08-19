@@ -37,8 +37,8 @@ SynMatch = collections.namedtuple(
 )
 
 SeqCorrect = collections.namedtuple(
-    "SeqCorrect", ["rt_idx", "ist_idx", "ist_seq", "mods"],
-    defaults=[None] * 4
+    "SeqCorrect", ["rt_idx", "rt_seq", "ist_idx", "ist_seq", "mods"],
+    defaults=[None] * 5
 )
 
 ProcMatch = collections.namedtuple(
@@ -53,6 +53,14 @@ TagPrecursor = collections.namedtuple(
      "pseq", "index", "tag", "pmods", "index_tag"],
     defaults=[None] * 11
 )
+
+
+def _peptide_mass(seq: str, mods: typing.List[ModSite]):
+    """ Calculate peptide mass. """
+    m = sum(constants.AA_MASSES[a].mono for a in seq)
+    if mods:
+        m += sum(mod.mass for mod in mods)
+    return m + constants.FIXED_MASSES["H2O"]
 
 
 def _common_substr(seq1: str, seq2: str) -> typing.List[str]:
@@ -257,15 +265,12 @@ class _Spectrum:
         self.sequence_tags = seq_tags
         self.peak_index = index_tags
 
-    def match_sequence(self, seq: str, mods: ModSite = None):
+    def match_sequence(self, seq: str, mods: typing.List[ModSite]):
         """ Match sequence. """
         # parse modifications to separate them into three parts
         self._parse_modification(mods)
         # precursor mass
-        pmass = (sum(constants.AA_MASSES[a].mono for a in seq)
-                 + constants.FIXED_MASSES["H2O"])
-        if mods:
-            pmass += sum(_m.mass for _m in mods)
+        pmass = _peptide_mass(seq, mods)
 
         # match seq by common subsequences
         prec_tag, assigned = [], set()
@@ -376,6 +381,7 @@ class CorrectSynthesisMatch:
 
         # matches to synthetic peptides
         matches = self._match_syn_peptide(psm, syn_peps)
+
         # refine the matches
         if matches:
             for match in matches:
@@ -414,6 +420,7 @@ class CorrectSynthesisMatch:
 
             # consider artificial modifications too
             pep_candidates += self._add_mods(seq, mods, mz)
+            pep_candidates += self._add_residue(seq, mods, mz)
 
         return pep_candidates
 
@@ -494,6 +501,8 @@ class CorrectSynthesisMatch:
 
             # all possible corrections
             corrects = self._correct_mass(s, dm, combs, combs_add, artifs)
+            print(len(corrects))
+            print(corrects[:10])
             for corr in corrects:
                 mods_c = []
                 if corr.ist_idx is None:
@@ -564,8 +573,8 @@ class CorrectSynthesisMatch:
             for r1, m1 in zip(res_i, mass_i):
                 # compensates from other residue combinations
                 ix, = np.where(np.absolute(m1 - res_mass - dm) <= self.tol)
-                compx = [(add_res[i], res_mass[i], "seq") for i in ix
-                         if not set(r1) & set(add_res[i])]
+                compx = [(add_res[i], res_mass[i], "seq")
+                         for i in ix if not set(r1) & set(add_res[i])]
                 # compensates from modifications
                 ix, = np.where(np.absolute(m1 - mod_mass - dm) <= self.tol)
                 compx += [(add_mod[i], mod_mass[i], "mod") for i in ix]
@@ -639,9 +648,10 @@ class CorrectSynthesisMatch:
             else:
                 # matches
                 for seq, rt in zip(seqs, rt_index):
-                    ix = [i + 1 for i, r in enumerate(seq) if r == t]
-                    adds += [SeqCorrect(rt_idx=rt, mods=[ModSite(mass, i, m)])
-                             for i in ix]
+                    adds += [
+                        SeqCorrect(rt_idx=rt, mods=[ModSite(mass, i + 1, m)])
+                        for i, r in enumerate(seq) if r == t
+                    ]
 
         return adds
 
@@ -649,9 +659,7 @@ class CorrectSynthesisMatch:
         """ Add artificial modifications to sequence. """
         candidates = []
         # calculate mass
-        pmass = (sum(constants.AA_MASSES[a].mono for a in seq)
-                 + constants.FIXED_MASSES["H2O"]
-                 + sum(mod.mass for mod in mods))
+        pmass = _peptide_mass(seq, mods)
         # get possible modified sites
         unmod_res = [(i+1, r) for i, r in enumerate(seq)
                      if not any(mod.site == i+1 for mod in mods)]
@@ -689,6 +697,72 @@ class CorrectSynthesisMatch:
                     mod_x.append(ModSite(m, site, name))
                 candidates.append(Peptide(seq, c, mod_x + mods))
 
+        return candidates
+
+    def _add_residue(self, seq, mods, mz):
+        """ Add residues to sequence. """
+        pmass = _peptide_mass(seq, mods)
+        mz_neutral = mz - constants.FIXED_MASSES["H"]
+        # re-set the sequence by replacing the modified residue by number
+        pre_mods, seq_x, mods_bk = [], seq, {}
+        for i, mod in enumerate(mods):
+            if isinstance(mod.site, str):
+                pre_mods.append(mod)
+            else:
+                j = mod.site-1
+                seq_x = f"{seq_x[:j]}{i}{seq_x[j+1:]}"
+                mods_bk[f"{i}"] = {"n": mod.mod, "r": seq[j], "m": mod.mass}
+
+        # added masses
+        candidate_residues = list(set(seq))
+        masses = [constants.AA_MASSES[a].mono for a in candidate_residues]
+        candidate_idx = list(range(len(candidate_residues)))
+        # combination of 2 residues for insertion
+        masses += [m1 + m2 for m1, m2 in itertools.product(masses, masses)]
+        candidate_idx += list(itertools.product(candidate_idx, candidate_idx))
+
+        # convert the list to masses
+        masses = np.array(masses)
+
+        # partition the sequence in all possibilities
+        n = len(seq_x)
+        all_seqs_l1 = [tuple([seq_x[:i], seq_x[i:]]) for i in range(n)]
+        all_seqs_l2 = [
+            tuple([seq_x[i:j] for i, j
+                   in zip([0] + list(ix), list(ix) + [None])])
+            for ix in itertools.combinations_with_replacement(range(n), 2)
+        ]
+
+        # insert residues into the sequence
+        new_seqs = []
+        for c in range(2, 5):
+            mass = mz_neutral * c
+            dm = mass - pmass
+            # do all possible combinations
+            match_ix, = np.where(np.absolute(dm - masses) <= self.tol)
+            for i in match_ix:
+                ix = candidate_idx[i]
+                if isinstance(ix, int):
+                    new_seqs += [
+                        (c, "".join([s1, candidate_residues[ix], s2]))
+                        for s1, s2 in all_seqs_l1
+                    ]
+                else:
+                    new_seqs += [
+                        (c, "".join([s1, candidate_residues[ix[0]], s2,
+                                     candidate_residues[ix[1]], s3]))
+                        for s1, s2, s3 in all_seqs_l2
+                    ]
+
+        # parse them back to sequence and modifications
+        candidates = []
+        for c, pk in new_seqs:
+            mods_new = []
+            for i, val in mods_bk.items():
+                j = pk.index(i)
+                mods_new.append(ModSite(val["m"], j+1, val["n"]))
+                pk = pk.replace(i, val["r"])
+            candidates.append(Peptide(pk, c, pre_mods+mods_new))
         return candidates
 
     @staticmethod
@@ -737,9 +811,9 @@ class CorrectSynthesisMatch:
     def _sequence_tag_search(psm, syn_peptides):
         """ Search sequence tags and match to synthetic peptides. """
         # centroid spectrum
-        _spectrum = psm.spectrum.centroid()
+        spectrum = psm.spectrum.centroid()
         # spectrum object
-        proc_spectrum = _Spectrum(_spectrum._peaks, _spectrum.prec_mz)
+        proc_spectrum = _Spectrum(spectrum._peaks, spectrum.prec_mz)
         # denoise
         _ = proc_spectrum.denoise()
         # get sequence tags
@@ -759,9 +833,7 @@ class CorrectSynthesisMatch:
                         (0, n))
                 )
                 # precursor mass of subsequence containing the tag
-                ms = (sum(constants.AA_MASSES[a].mono for a in tag.seq_term)
-                      + constants.FIXED_MASSES["H2O"]
-                      + sum(mod.mass for mod in tag.mods_tag))
+                ms = _peptide_mass(tag.seq_term, tag.mods_tag)
                 mp = tag.mz_tag - constants.FIXED_MASSES["H"]
                 # match object to tag precursor
                 m = SynMatch(seq=tag.seq_term, mods=tag.mods_tag, charge=1,
@@ -796,9 +868,7 @@ class CorrectSynthesisMatch:
                     )
                 elif mod.site == "cterm":
                     corr_mods.append(mod)
-        m = (sum(constants.AA_MASSES[a].mono for a in corr_seq)
-             + constants.FIXED_MASSES["H2O"]
-             + sum(mod.mass for mod in corr_mods))
+        m = _peptide_mass(corr_seq, corr_mods)
 
         return SynMatch(seq=corr_seq, mods=corr_mods, max_tag=tag.length+1,
                         ion_index=ion_index, delta_mass=m)
