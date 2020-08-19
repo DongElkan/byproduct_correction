@@ -37,7 +37,7 @@ SynMatch = collections.namedtuple(
 )
 
 SeqCorrect = collections.namedtuple(
-    "SeqCorrect", ["rt_idx", "rt_seq", "ist_idx", "ist_seq", "mods"],
+    "SeqCorrect", ["rm_idx", "rt_seq", "ist_idx", "ist_seq", "mods"],
     defaults=[None] * 5
 )
 
@@ -53,6 +53,16 @@ TagPrecursor = collections.namedtuple(
      "pseq", "index", "tag", "pmods", "index_tag"],
     defaults=[None] * 11
 )
+
+
+def mix(c: str, s: str, p: str = ''):
+    """
+    Insert characters c into all places in string s
+    This is the answer in StackOverFlow:
+    https://stackoverflow.com/questions/63488042/python-fast-insert-multiple-characters-into-all-possible-places-of-string/63488696#63488696
+    Thanks to superb rain.
+    """
+    return c and s and mix(c[1:], s, p+c[0]) + mix(c, s[1:], p+s[0]) or [p + c + s]
 
 
 def _peptide_mass(seq: str, mods: typing.List[ModSite]):
@@ -500,33 +510,39 @@ class CorrectSynthesisMatch:
                 continue
 
             # all possible corrections
-            corrects = self._correct_mass(s, dm, combs, combs_add, artifs)
-            for corr in corrects:
-                mods_c = []
-                if corr.ist_idx is None:
-                    seq_c = "".join(rp[corr.rt_idx]).upper()
-                    # reset modifications
-                    for mod in sepm.mods_proc:
-                        if mod.site-1 in corr.rt_idx:
-                            j = int(corr.rt_idx.index(mod.site-1))
-                            mods_c.append(mod._replace(site=j+1))
-                    # set up modification sites from corrections.
-                    if corr.mods is not None:
-                        mods_c += corr.mods
-                else:
-                    iseq = np.array(corr.ist_seq, dtype=str)
-                    seq_c = "".join(
-                        np.insert(rp[corr.rt_idx], corr.ist_idx, iseq)
-                    )
-                    # reset modifications
-                    for mod in sepm.mods_proc:
-                        if mod.site-1 in corr.rt_idx:
-                            j = corr.rt_idx.index(mod.site-1) + 1
-                            # if residue insert in current subsequence,
-                            # reset modification site again.
-                            j2 = sum(i < j for i in corr.ist_idx)
-                            mods_c.append(mod._replace(site=int(j+j2)))
+            corrects_rm, corrects_adds = self._correct_mass(
+                s, dm, combs, combs_add, artifs
+            )
+            # correction for removing residues
+            corrects = []
+            for corr in corrects_rm:
+                seq_c, mods_c = corr.rt_seq.upper(), []
+                # reset modifications
+                for mod in sepm.mods_proc:
+                    e = mod.site-1
+                    if e not in corr.rm_idx:
+                        j = len([k for k in corr.rm_idx if k < e])
+                        mods_c.append(mod._replace(site=e-j+1))
+                # set up modification sites from corrections.
+                if corr.mods is not None:
+                    mods_c += corr.mods
+                corrects.append((seq_c, mods_c))
 
+            # corrections for adding residues and modifications
+            for corr in corrects_adds:
+                seq_c, mods_c = corr.rt_seq.upper(), []
+                # reset modifications
+                # TODO: modification sites should be corrected.
+                for mod in sepm.mods_proc:
+                    if mod.site-1 not in corr.rm_idx:
+                        j = corr.rt_idx.index(mod.site-1) + 1
+                        # if residue insert in current subsequence,
+                        # reset modification site again.
+                        j2 = sum(i < j for i in corr.ist_idx)
+                        mods_c.append(mod._replace(site=int(j+j2)))
+                corrects.append((seq_c, mods_c))
+
+            for seq_c, mods_c in corrects:
                 seq, mods = self._reconstruct_peptide(sepm, seq_c, mods_c)
                 # if the peptide has been identified, ignore it.
                 pep = self._combine_mods(seq, mods)
@@ -550,8 +566,8 @@ class CorrectSynthesisMatch:
             artifacts: Artifacts.
 
         """
-        corrects = []
-        # additionals
+        corrects_rm, corrects_add = [], []
+        # additions
         add_res, res_mass = res_combs_add["residues"], res_combs_add["mass"]
         add_mod, mod_mass = artifacts["mods"], artifacts["mass"]
         # match residue combinations
@@ -563,31 +579,32 @@ class CorrectSynthesisMatch:
             if dm > 0 and i > 0:
                 # remove residues from subseq in candidates
                 for res in res_i[np.absolute(mass_i - dm) <= self.tol]:
-                    rt_ix, _ = self._remove_mass(seq, res)
-                    if rt_ix is not None:
-                        corrects += [SeqCorrect(rt_idx=ix) for ix in rt_ix]
+                    rm_ix, rt_seqs = self._remove_mass(seq, res)
+                    if rm_ix is not None:
+                        corrects_rm += [
+                            SeqCorrect(rm_idx=ix, rt_seq=s) for ix, s in zip(rm_ix, rt_seqs)
+                        ]
 
             # further combination of residues and modifications
             for r1, m1 in zip(res_i, mass_i):
+                # remove residues
+                rm_ix, seqs = self._remove_mass(seq, r1)
+                if rm_ix is None:
+                    continue
                 # compensates from other residue combinations
                 ix, = np.where(np.absolute(m1 - res_mass - dm) <= self.tol)
-                compx = [(add_res[i], res_mass[i], "seq")
-                         for i in ix if not set(r1) & set(add_res[i])]
+                r1_set = set(r1)
+                for j in ix:
+                    if not r1_set & set(add_res[j]):
+                        corrects_rm += self._add_mass(seqs, rm_ix, add_res[j])
                 # compensates from modifications
-                ix, = np.where(np.absolute(m1 - mod_mass - dm) <= self.tol)
-                compx += [(add_mod[i], mod_mass[i], "mod") for i in ix]
+                ix = np.absolute(m1 - mod_mass - dm) <= self.tol
+                for mod, m in zip(add_mod[ix], mod_mass[ix]):
+                    corrects_add += self._add_mass(
+                        seqs, ix, mod, seq_type="mod", mass=m
+                    )
 
-                if compx:
-                    # remove residues
-                    ix, seqs = self._remove_mass(seq, r1)
-                    if ix is not None:
-                        # add up new residues or modifications
-                        for res, m2, _type in compx:
-                            corrects += self._add_mass(
-                                seqs, ix, res, seq_type=_type, mass=m2
-                            )
-
-        return corrects
+        return corrects_rm, corrects_add
 
     @staticmethod
     def _remove_mass(seq, rm_seq):
@@ -612,42 +629,39 @@ class CorrectSynthesisMatch:
             del_ix.append(list(itertools.combinations(ix, rseq_counts[r])))
 
         # all combinations of residues to remove
-        rt_index, rt_seqs, n = [], [], len(seq)
+        rm_index, rt_seqs = [], []
         for _comb in itertools.product(*del_ix):
-            ix = set(itertools.chain(*_comb))
-            rt_ix = [i for i in range(n) if i not in ix]
-            rt_index.append(rt_ix)
-            rt_seqs.append("".join(arr_seq[rt_ix]))
+            x = set(itertools.chain(*_comb))
+            rm_index.append(x)
+            rt_seqs.append("".join(r for i, r in enumerate(seq) if i not in x))
 
-        return rt_index, rt_seqs
+        return rm_index, rt_seqs
 
     @staticmethod
-    def _add_mass(seqs, rt_index, add_seq, seq_type="seq", mass=None):
+    def _add_mass(seqs, rm_index, add_seq, seq_type="seq", mass=None):
         """ Add residues to seq. """
         adds = []
         # simply insert add_seq to seq
         if seq_type == "seq":
-            n = len(add_seq)
-            for rt in rt_index:
-                ix = range(len(rt) + 1)
-                adds += [
-                    SeqCorrect(rt_idx=rt, ist_idx=x, ist_seq=seq_sub)
-                    for x in itertools.combinations_with_replacement(ix, n)
-                    for seq_sub in itertools.combinations(add_seq, n)
-                ]
+            for t, s in zip(rm_index, seqs):
+                seqs_adds = mix(add_seq, s)
+                adds += [SeqCorrect(rm_idx=t, ist_seq=add_seq, rt_seq=x)
+                         for x in seqs_adds]
 
         # add modifications to seq
         elif seq_type == "mod":
             m, t = add_seq[0], add_seq[1]
             # sites
             if t not in constants.AA_MASSES:
-                adds += [SeqCorrect(rt_idx=ix, mods=[ModSite(mass, t, m)])
-                         for ix in rt_index]
+                adds += [SeqCorrect(rm_idx=ix, rt_seq=seq,
+                                    mods=[ModSite(mass, t, m)])
+                         for ix, seq in zip(rm_index, seqs)]
             else:
                 # matches
-                for seq, rt in zip(seqs, rt_index):
+                for seq, rt in zip(seqs, rm_index):
                     adds += [
-                        SeqCorrect(rt_idx=rt, mods=[ModSite(mass, i + 1, m)])
+                        SeqCorrect(rm_idx=rt, rt_seq=seq,
+                                   mods=[ModSite(mass, i + 1, m)])
                         for i, r in enumerate(seq) if r == t
                     ]
 
