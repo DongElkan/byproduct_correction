@@ -501,8 +501,6 @@ class CorrectSynthesisMatch:
 
             # all possible corrections
             corrects = self._correct_mass(s, dm, combs, combs_add, artifs)
-            print(len(corrects))
-            print(corrects[:10])
             for corr in corrects:
                 mods_c = []
                 if corr.ist_idx is None:
